@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visualizador LiDAR 3D (Local)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; pointer-events: none; }
+        .interactive { pointer-events: auto; }
+        
+        /* Spinner de Carregamento */
+        .loader {
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-left-color: #3b82f6;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="font-sans antialiased">
+
+    <!-- Contentor do WebGL -->
+    <div id="canvas-container"></div>
+
+    <!-- Camada de Interface -->
+    <div id="ui-layer" class="p-4 flex flex-col justify-between">
+        
+        <!-- Painel Superior -->
+        <div class="interactive bg-gray-900/80 backdrop-blur-md p-6 rounded-2xl shadow-2xl border border-gray-700 max-w-sm w-full transition-all">
+            <h1 class="text-2xl font-bold mb-1 text-blue-400">Visualizador LiDAR</h1>
+            <p class="text-xs text-gray-400 mb-6">Processamento 100% local no seu navegador.</p>
+            
+            <label for="file-upload" class="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-600 rounded-xl cursor-pointer bg-gray-800 hover:bg-gray-700 hover:border-blue-500 transition-colors">
+                <div class="flex flex-col items-center justify-center pt-5 pb-6">
+                    <svg class="w-8 h-8 mb-3 text-gray-400" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 16">
+                        <path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"/>
+                    </svg>
+                    <p class="mb-2 text-sm text-gray-300"><span class="font-semibold">Clique para carregar</span> ou arraste</p>
+                    <p class="text-xs text-gray-500">Formatos suportados: .LAS, .LAZ</p>
+                </div>
+                <input id="file-upload" type="file" class="hidden" accept=".las,.laz" />
+            </label>
+
+            <!-- Estado de Carregamento & Erros -->
+            <div id="loading-indicator" class="hidden flex-col items-center justify-center mt-4 bg-gray-800/50 p-3 rounded-lg">
+                <div id="spinner" class="loader mb-2"></div>
+                <p class="text-sm text-blue-300 text-center" id="loading-text">A ler ficheiro...</p>
+            </div>
+
+            <!-- Controlos da Nuvem -->
+            <div id="controls-panel" class="hidden mt-6 space-y-4">
+                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700">
+                    <p class="text-sm text-gray-400">Pontos carregados:</p>
+                    <p class="text-xl font-mono font-bold text-white" id="point-count">0</p>
+                </div>
+
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Tamanho do Ponto</label>
+                    <input type="range" id="point-size" min="0.01" max="10" step="0.01" value="0.5" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                </div>
+            </div>
+        </div>
+
+        <!-- Instruções Inferiores -->
+        <div class="interactive self-start bg-gray-900/60 backdrop-blur px-4 py-2 rounded-full border border-gray-700 mt-auto text-sm text-gray-300 flex items-center gap-4">
+            <span>🖱️ <b>Botão Esquerdo</b>: Girar</span>
+            <span>🖱️ <b>Botão Direito</b>: Mover</span>
+            <span>🖱️ <b>Scroll</b>: Zoom</span>
+        </div>
+    </div>
+
+    <!-- Scripts em ES Modules -->
+    <script type="module">
+        import * as THREE from 'https://esm.sh/three@0.160.0';
+        import { OrbitControls } from 'https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+        import { parse } from 'https://esm.sh/@loaders.gl/core@4.1.0';
+        import { LASLoader } from 'https://esm.sh/@loaders.gl/las@4.1.0';
+
+        // Elementos da UI
+        const fileInput = document.getElementById('file-upload');
+        const loadingIndicator = document.getElementById('loading-indicator');
+        const spinner = document.getElementById('spinner');
+        const controlsPanel = document.getElementById('controls-panel');
+        const pointCountDisplay = document.getElementById('point-count');
+        const pointSizeSlider = document.getElementById('point-size');
+        const loadingText = document.getElementById('loading-text');
+
+        // Configuração Base do Three.js
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#111111');
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 10000);
+        camera.position.set(0, 50, 100);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Eixos de referência (RGB = XYZ)
+        const axesHelper = new THREE.AxesHelper(10);
+        scene.add(axesHelper);
+
+        // Variáveis de estado
+        let currentPointCloud = null;
+        let pointsMaterial = null;
+
+        // Loop de Animação
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Responsividade
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Controlo do tamanho dos pontos
+        pointSizeSlider.addEventListener('input', (e) => {
+            if (pointsMaterial) {
+                pointsMaterial.size = parseFloat(e.target.value);
+            }
+        });
+
+        // Lógica de Leitura e Parse do Ficheiro
+        fileInput.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            // UI Reset
+            loadingIndicator.classList.remove('hidden');
+            controlsPanel.classList.add('hidden');
+            loadingIndicator.style.display = 'flex';
+            spinner.style.display = 'block';
+            loadingText.className = "text-sm text-blue-300 text-center animate-pulse";
+            loadingText.innerText = `A processar ${file.name}...\n(O ecrã pode congelar temporariamente)`;
+
+            // Pequeno atraso para permitir que a UI atualize antes de congelar a thread
+            await new Promise(resolve => setTimeout(resolve, 100));
+
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+
+                // IMPORTANTE: worker: false obriga a processar na thread principal.
+                // Evita problemas de CORS de WebWorkers em iframes restritas (como o preview do chat).
+                const data = await parse(arrayBuffer, LASLoader, {
+                    worker: false 
+                });
+
+                processPointCloud(data);
+
+                // UI updates
+                pointCountDisplay.innerText = new Intl.NumberFormat('pt-PT').format(data.header.vertexCount);
+                controlsPanel.classList.remove('hidden');
+                loadingIndicator.style.display = 'none';
+
+            } catch (error) {
+                console.error("Erro detalhado:", error);
+                spinner.style.display = 'none';
+                loadingText.className = "text-sm text-red-400 text-center font-semibold mt-2";
+                loadingText.innerText = `Erro ao abrir: ${error.message}\n\nIsto acontece frequentemente em ambientes de teste (iframes) devido a bloqueios de WebAssembly. Funcionará no GitHub Pages.`;
+            } finally {
+                fileInput.value = ""; 
+            }
+        });
+
+        function processPointCloud(data) {
+            if (currentPointCloud) {
+                scene.remove(currentPointCloud);
+                currentPointCloud.geometry.dispose();
+                currentPointCloud.material.dispose();
+            }
+
+            const positions = data.attributes.POSITION.value;
+            const geometry = new THREE.BufferGeometry();
+            
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+            // Colorização por elevação
+            const colors = new Float32Array(positions.length);
+            let minZ = Infinity;
+            let maxZ = -Infinity;
+            for (let i = 2; i < positions.length; i += 3) {
+                if (positions[i] < minZ) minZ = positions[i];
+                if (positions[i] > maxZ) maxZ = positions[i];
+            }
+
+            const colorObj = new THREE.Color();
+            for (let i = 0, j = 0; i < positions.length; i += 3, j += 3) {
+                const z = positions[i + 2];
+                const normalizedZ = (z - minZ) / (maxZ - minZ || 1);
+                colorObj.setHSL(0.7 - (normalizedZ * 0.7), 1.0, 0.5);
+                colors[j] = colorObj.r;
+                colors[j + 1] = colorObj.g;
+                colors[j + 2] = colorObj.b;
+            }
+
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            pointsMaterial = new THREE.PointsMaterial({
+                size: parseFloat(pointSizeSlider.value),
+                vertexColors: true,
+                sizeAttenuation: false
+            });
+
+            currentPointCloud = new THREE.Points(geometry, pointsMaterial);
+
+            geometry.computeBoundingBox();
+            const center = new THREE.Vector3();
+            geometry.boundingBox.getCenter(center);
+            currentPointCloud.position.sub(center);
+
+            const size = new THREE.Vector3();
+            geometry.boundingBox.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            
+            camera.position.set(0, maxDim * 0.8, maxDim * 1.2);
+            camera.lookAt(0, 0, 0);
+            controls.target.set(0, 0, 0);
+            
+            camera.near = maxDim / 1000;
+            camera.far = maxDim * 10;
+            camera.updateProjectionMatrix();
+
+            currentPointCloud.rotation.x = -Math.PI / 2;
+
+            scene.add(currentPointCloud);
+        }
+    </script>
+</body>
+</html>
